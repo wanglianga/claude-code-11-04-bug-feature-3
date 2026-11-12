@@ -65,6 +65,45 @@ class BatchStatus:
 class MatchStatus:
     PROPOSED = "PROPOSED"
     CONFIRMED = "CONFIRMED"
+    REJECTED = "REJECTED"   # 人工拒收自动建议（只追加轨迹，不物理删除建议行）
+
+
+class MatchMethod:
+    AUTO = "AUTO"       # 引擎自动建议，仅参考，必须人工确认后才生效
+    MANUAL = "MANUAL"   # 人工建立/人工确认
+
+
+class MatchLevel:
+    LEVEL1 = "ORDER_TO_SETTLEMENT"   # 订单业务事件 -> 渠道结算行
+    LEVEL2 = "SETTLEMENT_TO_BANK"    # 结算行 -> 银行流水
+
+
+class SplitRule:
+    """部分匹配的拆分方式。"""
+    FULL = "FULL"                    # 全额逐笔匹配
+    RATIO = "RATIO"                  # 按金额比例拆分
+    DETAIL = "DETAIL"                # 人工指定每条明细金额
+    CARRY_FORWARD = "CARRY_FORWARD"  # 未匹配余额结转挂账
+
+
+class CarryForwardStatus:
+    OPEN = "OPEN"            # 结转余额仍挂账，等待后续流水/结算行
+    RESOLVED = "RESOLVED"    # 已被后续人工匹配消化
+
+
+class SettlementLineType:
+    """结算行类型：订单类行参与 LEVEL1 订单匹配；保证金/调整项为非订单成分行。"""
+    CAPTURE = "CAPTURE"
+    REFUND = "REFUND"
+    CHARGEBACK = "CHARGEBACK"
+    CHARGEBACK_REVERSAL = "CHARGEBACK_REVERSAL"
+    FEE = "FEE"                          # 手续费行（含渠道幽灵费用）
+    RESERVE = "RESERVE"                  # 保证金/准备金扣留
+    RESERVE_RELEASE = "RESERVE_RELEASE"  # 保证金释放
+    ADJUSTMENT = "ADJUSTMENT"            # 调整项
+
+    # 不对应单笔订单事实的成分行，不走订单匹配，也不得当作“未知订单差”误报
+    NON_ORDER_TYPES = frozenset({"RESERVE", "RESERVE_RELEASE", "ADJUSTMENT"})
 
 
 class DiscrepancyKind:

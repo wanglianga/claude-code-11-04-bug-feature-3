@@ -27,9 +27,23 @@ CDC/Webhook/轮询/人工 → raw_events       → business_events（归一化�
 - `order_states / payment_states`：可更新的**投影**，按 `event_time` 重放；迟到旧事件不允许把状态打回。
 
 ### L3 结算匹配层
-- 匹配两级：`ORDER_TO_SETTLEMENT`（订单事件↔结算行）、`SETTLEMENT_TO_BANK`（结算单↔银行流水，支持一笔流水合并多单、部分分配）。
+- 匹配两级：`ORDER_TO_SETTLEMENT`（订单事件↔结算行）、`SETTLEMENT_TO_BANK`（结算行/批次↔银行流水，支持一笔流水合并多单、一行拆多笔、部分分配）。
+- `settlement_matches` 扩展留痕列：
+  - `confidence` 置信度（自动建议 60/75/90/95，人工确认/建立固定 100）、`match_basis` 匹配依据
+    （订单号精确/渠道号回退/金额精确/合并贪心/人工选择/比例拆分/明细拆分/跨主体人工）、`match_detail` JSONB 依据明细；
+  - `split_rule`（FULL/RATIO/DETAIL/CARRY_FORWARD）、`parent_match_id` 拆分组父子链、`carry_forward_id` 消化的挂账；
+  - `confirmed_by / confirm_comment / confirmed_at` 人工确认留痕；状态机 `PROPOSED → CONFIRMED / REJECTED`，拒收只追加不物理删除。
+- `match_carry_forwards` 未匹配余额结转挂账：入账不足（SHORT_FALL）、流水残差（RESIDUAL）、
+  拆分余额（PARTIAL_SPLIT）、跨主体（CROSS_ENTITY）单独结转，不允许用“总额相等”的其他流水凑平；
+  被后续人工匹配消化后置 RESOLVED。
+- 主体维度：`settlement_batches.legal_entity` 与 `bank_transactions.legal_entity` 不一致即为跨主体，
+  引擎不生成任何自动匹配，只提示 UNKNOWN 差异并挂账；人工核销必须显式 ack 并留痕 `CROSS_ENTITY_MANUAL`。
+- 结算行类型区分订单行（CAPTURE/REFUND/CHARGEBACK/...）与非订单成分行（FEE/RESERVE 保证金/RESERVE_RELEASE/ADJUSTMENT 调整项）；
+  成分行不参与订单匹配，也不会被误报为“幽灵结算行”未知差。
 - 差异五类：`AMOUNT / FEE / FX / TIMING / UNKNOWN`，均带 `dedup_key` 支持幂等重跑。
 - 引擎只写 `PROPOSED` 匹配与 `OPEN` 差异；`UNKNOWN` 必须人工调账后才能关闭。
+- 逐笔完成判定：每条结算行/流水的有效分配必须全部 CONFIRMED 且无未结转余额；
+  仅批次净额与银行入账合计相等（`totals_equal`）不构成逐笔匹配完成，工作台会显式警示“总额相等陷阱”。
 - `discrepancy_actions` 只追加，完整保留认领/附件/建议/过账/关闭轨迹。
 
 ### L4 月度汇总层

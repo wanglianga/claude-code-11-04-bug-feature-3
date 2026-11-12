@@ -178,3 +178,33 @@ pre.json {
 }
 .empty { text-align: center; color: var(--text-faint); padding: 36px 0; font-size: 13px; }
 .pill-row { display: flex; gap: 8px; flex-wrap: wrap; }
+
+/* ---------------- 两层匹配工作台 */
+.completion-tag {
+  display: inline-flex; align-items: center; padding: 5px 12px; border-radius: 20px;
+  font-size: 12px; font-weight: 600;
+}
+.completion-tag.ok { background: var(--green-soft); color: var(--green); }
+.completion-tag.warn { background: var(--amber-soft); color: var(--amber); }
+.warn-banner {
+  margin-top: 12px; padding: 10px 14px; border-radius: 8px;
+  background: var(--red-soft); color: var(--red); font-size: 12.5px; line-height: 1.6;
+  border: 1px solid #f0c9c9;
+}
+.tag {
+  display: inline-flex; align-items: center; padding: 1px 8px; border-radius: 6px;
+  font-size: 11px; font-weight: 600; background: #eef2f7; color: var(--slate);
+  white-space: nowrap;
+}
+.tag-component { background: var(--purple-soft); color: var(--purple); }
+.tag-cross { background: var(--red-soft); color: var(--red); }
+.tag-basis { background: var(--primary-soft); color: var(--primary); }
+.conf { font-weight: 700; font-variant-numeric: tabular-nums; }
+.conf-high { color: var(--green); }
+.conf-mid { color: var(--amber); }
+.conf-low { color: var(--red); }
+.link { color: var(--primary); cursor: pointer; font-size: 11.5px; margin-left: 4px; }
+.match-cell { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 4px; }
+.match-cell .json { width: 100%; margin: 4px 0 0; }
+tr.component-row td { background: #faf8ff; }
+tr.cross-row td { background: #fff7f7; }

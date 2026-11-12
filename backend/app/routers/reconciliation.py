@@ -111,6 +111,13 @@ async def list_matches(level: str | None = None,
             "allocated_amount": str(m.allocated_amount),
             "currency": m.currency, "status": m.status,
             "match_method": m.match_method,
+            "confidence": str(m.confidence) if m.confidence is not None else None,
+            "match_basis": m.match_basis,
+            "split_rule": m.split_rule,
+            "parent_match_id": m.parent_match_id,
+            "carry_forward_id": m.carry_forward_id,
+            "confirmed_by": m.confirmed_by,
+            "confirm_comment": m.confirm_comment,
             "confirmed_at": m.confirmed_at,
         }
         for m in rows
@@ -121,9 +128,17 @@ async def list_matches(level: str | None = None,
 async def confirm(match_id: int, data: MatchConfirmIn,
                   db: AsyncSession = Depends(get_db)):
     try:
-        m = await confirm_match(db, match_id, data.operator)
+        m = await confirm_match(
+            db, match_id, data.operator,
+            comment=data.comment,
+            acknowledge_cross_entity=data.acknowledge_cross_entity,
+        )
         await db.commit()
-        return {"id": m.id, "status": m.status, "match_method": m.match_method}
+        return {
+            "id": m.id, "status": m.status, "match_method": m.match_method,
+            "confidence": str(m.confidence) if m.confidence is not None else None,
+            "match_basis": m.match_basis, "confirmed_by": m.confirmed_by,
+        }
     except Exception as exc:
         await db.rollback()
         raise HTTPException(400, str(exc))

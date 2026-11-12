@@ -33,6 +33,15 @@ export default {
   confirmMatch: (id, operator) => api.post(`/matches/${id}/confirm`, { operator }),
   bankTxns: () => api.get('/bank-transactions'),
 
+  // 两层匹配工作台
+  matchingWorkspace: (batchId) => api.get(`/matching/workspace/${batchId}`),
+  confirmMatching: (id, payload) => api.post(`/matching/matches/${id}/confirm`, payload),
+  rejectMatching: (id, operator, comment) =>
+    api.post(`/matching/matches/${id}/reject`, { operator, comment }),
+  manualLevel1: (payload) => api.post('/matching/level1/manual', payload),
+  manualLevel2: (payload) => api.post('/matching/level2/manual', payload),
+  carryForwards: (params) => api.get('/matching/carry-forwards', { params }),
+
   // 差异处置
   discrepancies: (params) => api.get('/discrepancies', { params }),
   discrepancy: (id) => api.get(`/discrepancies/${id}`),

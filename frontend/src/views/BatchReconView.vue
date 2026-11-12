@@ -30,6 +30,7 @@
               <td><span class="badge" :class="b.status">{{ b.status }}</span></td>
               <td class="pill-row">
                 <button class="sm" @click="openBatch(b)">详情</button>
+                <button class="sm primary" @click="openWorkspace(b)">两层匹配</button>
                 <button v-if="b.status === 'OPEN'" class="sm" @click="reconcile(b)">对账</button>
                 <button v-if="b.status === 'OPEN'" class="sm danger" @click="close(b)">关闭</button>
               </td>
@@ -109,7 +110,10 @@
 
 <script setup>
 import { onMounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import api from '../api'
+
+const router = useRouter()
 
 const batches = ref([])
 const detail = ref(null)
@@ -131,6 +135,9 @@ async function openBatch(b) {
   const all = await api.matches({ batch_id: b.id })
   level2.value = all.filter((m) => m.match_level === 'SETTLEMENT_TO_BANK')
   snapshot.value = await api.snapshot(b.id)
+}
+function openWorkspace(b) {
+  router.push({ path: '/matching', query: { batch: b.id } })
 }
 async function reconcile(b) {
   try {

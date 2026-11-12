@@ -1,6 +1,6 @@
 """模拟事件数据集（2026-10 结算周期，渠道 STRIPE / 商户 M1）。
 
-覆盖 8 类场景：
+覆盖 9 类场景：
   S1 CDC 重放（同消息重投 + 轮询补拉同业务事实）
   S2 webhook 乱序（捕获先于授权到达；旧订单状态迟到试图回退）
   S3 支付后延迟入账（银行 11-15 才到，产生时间差）
@@ -9,6 +9,7 @@
   S6 结算单修订（v1 关闭后 v2 补手续费）
   S7 汇率更正（USD/CNY 7.20 -> 7.25，只追加更正账）
   S8 多笔合并入账（BK-001 一笔流水合并 3 个订单结算款）
+  S9 第二主体 ADYEN/M2（保证金/调整项/部分到账/跨主体/总额相等陷阱，见文件末尾）
 另含：金额差（ORD-007）、汇率差（ORD-009 EUR 订单渠道汇率不同）、
       未知差（幽灵结算行 + 银行流水残差）、关闭后补单。
 """
@@ -396,3 +397,97 @@ def late_october_refund_event() -> RawEventIn:
                     # 业务发生在 10-28（已关闭周期），11-10 才人工补录
                     "event_time": "2026-10-28T10:00:00+00:00",
                 }, Decimal("10"), Decimal("0.3")))
+
+
+# ---------------------------------------------------------------- S9 第二主体 ADYEN/M2
+# 场景覆盖：保证金扣留、调整项、部分到账拆分、跨主体银行流水、
+#           批次净额 == 银行合计但逐笔未匹配完成的“总额相等陷阱”。
+CHANNEL_M2 = "ADYEN"
+MERCHANT_M2 = "M2"
+ENTITY_M2 = "ENTITY-M2"
+ENTITY_M1 = "ENTITY-M1"
+
+
+def _m2_raw(key: str, source: str, occurred: str, topic: str, payload: dict) -> RawEventIn:
+    payload = dict(payload)
+    payload.setdefault("event_time", occurred)
+    payload["channel"] = CHANNEL_M2
+    payload["merchant_id"] = MERCHANT_M2
+    payload.setdefault("legal_entity", ENTITY_M2)
+    payload.setdefault("book_currency", BOOK_CCY)
+    payload.setdefault("decimal_places", 2)
+    return RawEventIn(
+        idempotency_key=key, source=source,
+        event_occurred_at=_dt(occurred), topic=topic, payload=payload,
+    )
+
+
+def m2_order_events() -> list[RawEventIn]:
+    """M2 主体三笔订单捕获（ORD-101/102/103）。"""
+    def capture(key, order, pref, amount, fee, day):
+        return _m2_raw(key, "WEBHOOK", f"2026-10-{day}T10:00:00+00:00", "payment", {
+            "event_type": "PAYMENT_CAPTURED", "entity_type": "CAPTURE",
+            "entity_ref": pref, "order_ref": order, "channel_ref": f"ADY-{pref}",
+            "business_key": f"PAYMENT_CAPTURED:{pref}:v1",
+            "amount": str(amount), "raw_amount": str(amount),
+            "fee_amount": str(fee),
+            "book_amount": str(amount * RATE_USD_CNY),
+            "book_fee_amount": str(fee * RATE_USD_CNY),
+            "txn_currency": "USD", "settle_currency": "USD",
+        })
+
+    return [
+        capture("WH-M2-101-CAP", "ORD-101", "P-101", Decimal("120"), Decimal("3"), "06"),
+        capture("WH-M2-102-CAP", "ORD-102", "P-102", Decimal("100"), Decimal("2.5"), "09"),
+        capture("WH-M2-103-CAP", "ORD-103", "P-103", Decimal("90"), Decimal("4.5"), "12"),
+    ]
+
+
+def m2_bank_events() -> list[RawEventIn]:
+    """两笔流水合计恰好等于批次净额 280，但一笔只部分到账、另一笔属于别的收款主体。"""
+    def bank(key, ref, amount, entity, booked, memo):
+        return _m2_raw(key, "WEBHOOK", booked, "bank.deposit", {
+            "event_type": "BANK_DEPOSIT_RECEIVED", "entity_type": "BANK_TXN",
+            "entity_ref": ref, "business_key": f"BANK_DEPOSIT_RECEIVED:{ref}:v1",
+            "bank_ref": ref, "currency": "USD", "legal_entity": entity,
+            "amount": str(amount), "book_amount": str(amount * RATE_USD_CNY),
+            "booked_at": booked, "memo": memo, "txn_currency": "USD",
+        })
+
+    return [
+        # 部分到账：净额 280 只到 200，剩余 80 需拆分挂账并结转
+        bank("BK-M2-1-EVT", "BK-M2-1", Decimal("200.00"), ENTITY_M2,
+             "2026-10-24T02:00:00+00:00", "ADYEN 部分到账（待后续补付）"),
+        # 总额凑平陷阱：收款主体是 ENTITY-M1，与结算主体 ENTITY-M2 不一致，禁止自动核销
+        bank("BK-M2-2-EVT", "BK-M2-2", Decimal("80.00"), ENTITY_M1,
+             "2026-10-25T02:00:00+00:00", "ADYEN 入账但收款主体为 ENTITY-M1（跨主体）"),
+    ]
+
+
+def settlement_m2_event() -> RawEventIn:
+    """SB-202610-M2：净额 280 = 银行两笔合计 280（总额相等但逐笔不能匹配完成）。
+
+    行构成：3 笔捕获 + 1 行保证金扣留（RESERVE）+ 1 行调整项（ADJUSTMENT）。
+    """
+    lines = [
+        _line("L-M2-001", "CAPTURE", "120", "3", "117", "ORD-101", "ADY-P-101"),
+        _line("L-M2-002", "CAPTURE", "100", "2.5", "97.5", "ORD-102", "ADY-P-102"),
+        _line("L-M2-003", "CAPTURE", "90", "4.5", "85.5", "ORD-103", "ADY-P-103"),
+        # 保证金/滚动准备金扣留：非订单成分行，不进订单匹配，工作台单独列示
+        _line("L-M2-RESERVE", "RESERVE", "0", "0", "-15"),
+        # 争议调整项：非订单成分行
+        _line("L-M2-ADJ", "ADJUSTMENT", "-5", "0", "-5"),
+    ]
+    return _m2_raw("SB-202610-M2-V1", "WEBHOOK", "2026-11-02T08:00:00+00:00",
+                   "settlement.batch", {
+        "event_type": "SETTLEMENT_BATCH_ISSUED", "entity_type": "SETTLEMENT",
+        "entity_ref": "SB-202610-M2",
+        "business_key": "SETTLEMENT_BATCH_ISSUED:SB-202610-M2:v1",
+        "batch_ref": "SB-202610-M2", "currency": "USD",
+        "legal_entity": ENTITY_M2,
+        "period_start": "2026-10-01T00:00:00+00:00",
+        "period_end": "2026-10-31T23:59:59+00:00",
+        "gross_amount": "305", "fee_amount": "10", "net_amount": "280",
+        "event_version": 1, "lines": lines,
+        "txn_currency": "USD", "amount": "280",
+    })

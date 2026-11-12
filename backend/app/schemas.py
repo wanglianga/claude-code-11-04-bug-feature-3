@@ -79,6 +79,42 @@ class CloseBatchIn(BaseModel):
 
 class MatchConfirmIn(BaseModel):
     operator: str
+    comment: str | None = None
+    # 跨主体（收款法人不一致）必须人工显式确认，系统不自动核销
+    acknowledge_cross_entity: bool = False
+
+
+class MatchRejectIn(BaseModel):
+    operator: str
+    comment: str
+
+
+class ManualLevel1In(BaseModel):
+    operator: str
+    business_event_id: int
+    settlement_line_id: int
+    comment: str | None = None
+
+
+class ManualLevel2ItemIn(BaseModel):
+    settlement_line_id: int
+    # DETAIL 拆分时必填的指定明细金额
+    amount: Decimal | None = None
+    # RATIO 拆分时的权重（任意正数，后端按权重总和归一化，尾差并入最后一行）
+    ratio: Decimal | None = None
+
+
+class ManualLevel2In(BaseModel):
+    operator: str
+    bank_transaction_id: int
+    split_rule: str = Field(
+        "FULL", description="FULL 全额 / RATIO 按比例 / DETAIL 指定明细"
+    )
+    items: list[ManualLevel2ItemIn]
+    comment: str | None = None
+    acknowledge_cross_entity: bool = False
+    # 可选：本笔分配用于消化既有结转挂账
+    carry_forward_id: int | None = None
 
 
 # ---------------------------------------------------------------- 出参

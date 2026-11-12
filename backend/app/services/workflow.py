@@ -12,7 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..enums import (
-    ActionType, DiscrepancyKind, DiscrepancyStatus, EventType, MatchStatus,
+    ActionType, DiscrepancyKind, DiscrepancyStatus, EventType,
 )
 from ..models import (
     BusinessEvent, Discrepancy, DiscrepancyAction, LedgerEntry,
@@ -194,15 +194,15 @@ async def close_discrepancy(db: AsyncSession, discrepancy_id: int,
     return d
 
 
-async def confirm_match(db: AsyncSession, match_id: int, operator: str) -> SettlementMatch:
-    m = await db.get(SettlementMatch, match_id)
-    if m is None:
-        raise WorkflowError("匹配不存在")
-    m.status = MatchStatus.CONFIRMED
-    m.match_method = "MANUAL"
-    m.confirmed_at = _now()
-    await db.flush()
-    return m
+async def confirm_match(db: AsyncSession, match_id: int, operator: str,
+                        comment: str | None = None,
+                        acknowledge_cross_entity: bool = False) -> SettlementMatch:
+    # 人工确认的完整规则（跨主体拦截、置信度 100、依据留痕）统一在匹配工作台服务
+    from .matching import confirm_match as _confirm
+    return await _confirm(
+        db, match_id, operator, comment=comment,
+        acknowledge_cross_entity=acknowledge_cross_entity,
+    )
 
 
 async def close_batch(db: AsyncSession, batch_id: int, operator: str) -> dict:

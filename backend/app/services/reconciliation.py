@@ -9,7 +9,7 @@
   - 不自动确认匹配、不自动核销任何差异，UNKNOWN 一律转人工；
   - 可重复执行，按逻辑键去重，幂等不产生重复差异。
 """
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from sqlalchemy import select
@@ -17,7 +17,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
 from ..enums import (
-    Account, DiscrepancyKind, DiscrepancyStatus, EventType, MatchStatus,
+    Account, DiscrepancyKind, DiscrepancyStatus, EventType, MatchLevel,
+    MatchMethod, MatchStatus, SettlementLineType, SplitRule,
 )
 from ..models import (
     BankTransaction, BusinessEvent, Discrepancy, LedgerEntry,
@@ -131,8 +132,13 @@ async def _reconcile_level1(db: AsyncSession, batch: SettlementBatch) -> int:
     ).scalars().all()
 
     for line in lines:
+        # 保证金/准备金、调整项等成分行不对应单笔订单事实：
+        # 不参与订单匹配，也不得当作“幽灵结算行”误报未知差（在工作台单独列示）
+        if line.line_type in SettlementLineType.NON_ORDER_TYPES:
+            continue
         want_event = _LINE_EVENT.get(line.line_type)
         candidate = None
+        basis = None
         if line.order_ref and want_event:
             candidate = (
                 await db.execute(
@@ -145,6 +151,8 @@ async def _reconcile_level1(db: AsyncSession, batch: SettlementBatch) -> int:
                     .limit(1)
                 )
             ).scalar_one_or_none()
+            if candidate is not None:
+                basis = "ORDER_REF_EXACT"
         if candidate is None and line.channel_ref:
             candidate = (
                 await db.execute(
@@ -154,6 +162,8 @@ async def _reconcile_level1(db: AsyncSession, batch: SettlementBatch) -> int:
                     .limit(1)
                 )
             ).scalar_one_or_none()
+            if candidate is not None:
+                basis = "CHANNEL_REF_FALLBACK"
 
         if candidate is None:
             # 结算行找不到订单侧事实：未知差，转人工
@@ -168,14 +178,27 @@ async def _reconcile_level1(db: AsyncSession, batch: SettlementBatch) -> int:
             continue
 
         if not await _match_exists(
-            db, match_level="ORDER_TO_SETTLEMENT",
+            db, match_level=MatchLevel.LEVEL1,
             business_event_id=candidate.id, settlement_line_id=line.id,
         ):
+            # 置信度仅代表引擎建议强度：订单号精确命中 95，渠道参考号回退命中 75；
+            # 无论分数多高都保持 PROPOSED，必须人工确认后才转为 CONFIRMED
+            confidence = Decimal("95.00") if basis == "ORDER_REF_EXACT" else Decimal("75.00")
             db.add(SettlementMatch(
-                match_level="ORDER_TO_SETTLEMENT",
+                match_level=MatchLevel.LEVEL1,
                 business_event_id=candidate.id, settlement_line_id=line.id,
                 allocated_amount=line.net_amount, currency=line.currency,
-                status=MatchStatus.PROPOSED, match_method="AUTO",
+                status=MatchStatus.PROPOSED, match_method=MatchMethod.AUTO,
+                confidence=confidence, match_basis=basis,
+                split_rule=SplitRule.FULL,
+                match_detail={
+                    "line_ref": line.line_ref,
+                    "entity_ref": candidate.entity_ref,
+                    "order_ref": candidate.order_ref,
+                    "channel_ref": candidate.channel_ref,
+                    "line_net": str(line.net_amount),
+                    "auto_suggestion": True,
+                },
             ))
             created += 1
         line.matched = True
@@ -245,8 +268,66 @@ async def _reconcile_level1(db: AsyncSession, batch: SettlementBatch) -> int:
 
 
 # ---------------------------------------------------------------- LEVEL 2
+async def _active_match_sum(db: AsyncSession, level: str) -> dict[int, Decimal]:
+    """汇总有效匹配（PROPOSED/CONFIRMED）的分配金额；REJECTED 建议不占用任何额度。"""
+    totals: dict[int, Decimal] = {}
+    rows = (
+        await db.execute(
+            select(SettlementMatch).where(
+                SettlementMatch.match_level == level,
+                SettlementMatch.status != MatchStatus.REJECTED,
+            )
+        )
+    ).scalars().all()
+    for m in rows:
+        key = m.bank_transaction_id if level == MatchLevel.LEVEL2 else m.settlement_line_id
+        totals[key] = totals.get(key, Decimal("0")) + m.allocated_amount
+    return totals
+
+
+async def _ensure_carry_forward(
+    db: AsyncSession, batch: SettlementBatch, source_type: str, reason: str,
+    amount: Decimal, currency: str, detail: dict,
+    settlement_line_id: int | None = None,
+    bank_transaction_id: int | None = None,
+    created_by: str = "reconcile-engine",
+) -> None:
+    """幂等登记未匹配余额结转挂账：同来源+同原因+OPEN 已存在则不重复建。"""
+    from ..models import MatchCarryForward
+    if amount <= TOLERANCE:
+        return
+    stmt = select(MatchCarryForward).where(
+        MatchCarryForward.batch_id == batch.id,
+        MatchCarryForward.source_type == source_type,
+        MatchCarryForward.reason == reason,
+        MatchCarryForward.status == "OPEN",
+    )
+    # 可空外键：NULL 用 IS NULL，非空用 = 绑定参数（IS $n 不是合法 SQL）
+    if settlement_line_id is None:
+        stmt = stmt.where(MatchCarryForward.settlement_line_id.is_(None))
+    else:
+        stmt = stmt.where(MatchCarryForward.settlement_line_id == settlement_line_id)
+    if bank_transaction_id is None:
+        stmt = stmt.where(MatchCarryForward.bank_transaction_id.is_(None))
+    else:
+        stmt = stmt.where(MatchCarryForward.bank_transaction_id == bank_transaction_id)
+    existed = (await db.execute(stmt)).scalar_one_or_none()
+    if existed is not None:
+        return
+    db.add(MatchCarryForward(
+        match_level=MatchLevel.LEVEL2, batch_id=batch.id, source_type=source_type,
+        settlement_line_id=settlement_line_id, bank_transaction_id=bank_transaction_id,
+        amount=quantize(amount), currency=currency, reason=reason,
+        status="OPEN", detail=detail, created_by=created_by,
+    ))
+
+
 async def _reconcile_level2(db: AsyncSession, batch: SettlementBatch) -> int:
-    """结算单净额 vs 银行流水。一笔银行流水可覆盖多个结算单（合并入账），按时间贪心分配。"""
+    """结算单净额 vs 银行流水。一笔银行流水可覆盖多个结算单（合并入账），按时间贪心分配。
+
+    跨主体（银行流水收款主体 != 结算单主体）的差异一律不自动建匹配，
+    只提示 UNKNOWN 差异并把金额挂结转，等待财务人工处理。
+    """
     created = 0
     # 同渠道同币种、周期前后各留 TIMING_DAYS 容差窗口的银行流水
     banks = (
@@ -262,24 +343,49 @@ async def _reconcile_level2(db: AsyncSession, batch: SettlementBatch) -> int:
         )
     ).scalars().all()
 
-    # 已分配金额（流水可能被多个批次共享）
-    allocated: dict[int, Decimal] = {}
+    # 已分配金额（流水可能被多个批次共享）；REJECTED 建议不占额度
+    allocated = await _active_match_sum(db, MatchLevel.LEVEL2)
     existing = (
         await db.execute(
-            select(SettlementMatch).where(SettlementMatch.match_level == "SETTLEMENT_TO_BANK")
+            select(SettlementMatch).where(SettlementMatch.match_level == MatchLevel.LEVEL2)
         )
     ).scalars().all()
     # 本批次历史轮次已分配的金额：重跑时必须扣除，否则会重复报“入账不足”
     already_for_batch = Decimal("0")
     for m in existing:
-        allocated[m.bank_transaction_id] = allocated.get(
-            m.bank_transaction_id, Decimal("0")
-        ) + m.allocated_amount
+        if m.status == MatchStatus.REJECTED:
+            continue
         if m.settlement_batch_id == batch.id:
             already_for_batch += m.allocated_amount
 
     remaining_need = quantize(batch.net_amount - already_for_batch)
     for bank in banks:
+        # 跨主体：引擎只提示，不自动核销、不自动建匹配
+        if bank.legal_entity != batch.legal_entity:
+            await _raise_discrepancy(
+                db, batch, DiscrepancyKind.UNKNOWN,
+                f"银行流水 {bank.bank_ref} 收款主体 {bank.legal_entity} "
+                f"与结算主体 {batch.legal_entity} 不一致，禁止自动核销",
+                Decimal("0"), bank.amount, bank.currency,
+                dedup_key=f"L2-CROSS-ENTITY:{batch.id}:{bank.id}",
+                detail={
+                    "bank_ref": bank.bank_ref,
+                    "bank_legal_entity": bank.legal_entity,
+                    "batch_legal_entity": batch.legal_entity,
+                    "cross_entity": True,
+                },
+                bank=bank,
+            )
+            await _ensure_carry_forward(
+                db, batch, "BANK_TRANSACTION", "CROSS_ENTITY",
+                bank.amount - allocated.get(bank.id, Decimal("0")),
+                bank.currency,
+                {"bank_ref": bank.bank_ref, "from_entity": bank.legal_entity,
+                 "to_entity": batch.legal_entity},
+                bank_transaction_id=bank.id,
+            )
+            continue
+
         available = bank.amount - allocated.get(bank.id, Decimal("0"))
         if available <= TOLERANCE or remaining_need <= TOLERANCE:
             continue
@@ -288,24 +394,53 @@ async def _reconcile_level2(db: AsyncSession, batch: SettlementBatch) -> int:
         dup = (
             await db.execute(
                 select(SettlementMatch).where(
-                    SettlementMatch.match_level == "SETTLEMENT_TO_BANK",
+                    SettlementMatch.match_level == MatchLevel.LEVEL2,
                     SettlementMatch.settlement_batch_id == batch.id,
                     SettlementMatch.bank_transaction_id == bank.id,
+                    SettlementMatch.status != MatchStatus.REJECTED,
                 )
             )
         ).scalar_one_or_none()
-        if dup is None:
+        # 人工已拒收的建议保持拒收轨迹，引擎重跑不得复活；
+        # 该流水对本批次的可用额度改由人工手工匹配决定
+        rejected = (
+            await db.execute(
+                select(SettlementMatch).where(
+                    SettlementMatch.match_level == MatchLevel.LEVEL2,
+                    SettlementMatch.settlement_batch_id == batch.id,
+                    SettlementMatch.bank_transaction_id == bank.id,
+                    SettlementMatch.status == MatchStatus.REJECTED,
+                )
+            )
+        ).scalar_one_or_none()
+        if dup is None and rejected is None:
+            # 本笔分配恰好结清批次剩余应收 -> 金额精确匹配，建议置信度高；
+            # 仅部分覆盖（合并入账/部分到账）-> 贪心合并建议，置信度低，必须人工复核拆分
+            fully_covers = quantize(remaining_need - take) <= TOLERANCE
+            basis = "AMOUNT_EXACT" if fully_covers else "MERGED_GREEDY"
+            confidence = Decimal("90.00") if fully_covers else Decimal("60.00")
             db.add(SettlementMatch(
-                match_level="SETTLEMENT_TO_BANK",
+                match_level=MatchLevel.LEVEL2,
                 settlement_batch_id=batch.id,
                 bank_transaction_id=bank.id,
                 allocated_amount=quantize(take),
                 currency=batch.currency,
-                status=MatchStatus.PROPOSED, match_method="AUTO",
+                status=MatchStatus.PROPOSED, match_method=MatchMethod.AUTO,
+                confidence=confidence, match_basis=basis,
+                split_rule=SplitRule.FULL,
+                match_detail={
+                    "bank_ref": bank.bank_ref,
+                    "batch_ref": batch.batch_ref,
+                    "bank_available_before": str(available),
+                    "batch_remaining_before": str(remaining_need),
+                    "fully_covers_batch": fully_covers,
+                    "auto_suggestion": True,
+                },
             ))
             created += 1
-        allocated[bank.id] = allocated.get(bank.id, Decimal("0")) + take
-        remaining_need = quantize(remaining_need - take)
+            # 仅在真正建立建议时占用额度；拒收分支不占用，交由人工手工匹配
+            allocated[bank.id] = allocated.get(bank.id, Decimal("0")) + take
+            remaining_need = quantize(remaining_need - take)
 
         # 时间差：入账显著晚于结算周期
         lag = (bank.booked_at - batch.period_end).days
@@ -319,7 +454,8 @@ async def _reconcile_level2(db: AsyncSession, batch: SettlementBatch) -> int:
                 bank=bank,
             )
 
-    # 结算单未被银行流水完全覆盖：未知差（缺入账），禁止自动核销
+    # 结算单未被银行流水完全覆盖：未知差（缺入账），禁止自动核销；
+    # 未匹配余额单独结转挂账，不允许用“总额相等”的其他流水凑平
     if remaining_need > TOLERANCE:
         await _raise_discrepancy(
             db, batch, DiscrepancyKind.UNKNOWN,
@@ -328,20 +464,71 @@ async def _reconcile_level2(db: AsyncSession, batch: SettlementBatch) -> int:
             dedup_key=f"L2-SHORT:{batch.id}",
             detail={"missing_amount": str(remaining_need)},
         )
+        await _ensure_carry_forward(
+            db, batch, "SETTLEMENT_LINE", "SHORT_FALL",
+            remaining_need, batch.currency,
+            {"batch_ref": batch.batch_ref, "missing_amount": str(remaining_need)},
+        )
+    await _settle_engine_carries(db, batch)
     await db.flush()
     return created
+
+
+async def _settle_engine_carries(db: AsyncSession, batch: SettlementBatch) -> None:
+    """重跑对账时结清已不复存在的引擎挂账：人工建立的 PARTIAL_SPLIT/跨主体挂账不动。"""
+    from ..models import MatchCarryForward
+    rows = (
+        await db.execute(
+            select(MatchCarryForward).where(
+                MatchCarryForward.batch_id == batch.id,
+                MatchCarryForward.status == "OPEN",
+                MatchCarryForward.created_by == "reconcile-engine",
+            )
+        )
+    ).scalars().all()
+    allocations = await _active_match_sum(db, MatchLevel.LEVEL2)
+    for cf in rows:
+        if cf.reason == "SHORT_FALL":
+            # 批次缺口已被后续流水覆盖
+            active_batch = quantize(sum(
+                (m.allocated_amount for m in (await db.execute(
+                    select(SettlementMatch).where(
+                        SettlementMatch.match_level == MatchLevel.LEVEL2,
+                        SettlementMatch.settlement_batch_id == batch.id,
+                        SettlementMatch.status != MatchStatus.REJECTED,
+                    )
+                )).scalars().all()),
+                Decimal("0"),
+            ))
+            if quantize(batch.net_amount - active_batch) <= TOLERANCE:
+                cf.status = "RESOLVED"
+                cf.resolved_at = datetime.now(timezone.utc)
+        elif cf.reason == "RESIDUAL" and cf.bank_transaction_id:
+            bank = await db.get(BankTransaction, cf.bank_transaction_id)
+            if bank is not None and quantize(
+                bank.amount - allocations.get(bank.id, Decimal("0"))
+            ) <= TOLERANCE:
+                cf.status = "RESOLVED"
+                cf.resolved_at = datetime.now(timezone.utc)
 
 
 async def _check_bank_residuals(db: AsyncSession) -> int:
     """全局残差检查：所有 LEVEL2 分配完成后，银行流水仍有未解释余额才报未知差。"""
     created = 0
-    allocations: dict[int, Decimal] = {}
-    for m in (await db.execute(
-        select(SettlementMatch).where(SettlementMatch.match_level == "SETTLEMENT_TO_BANK")
-    )).scalars().all():
-        allocations[m.bank_transaction_id] = allocations.get(
-            m.bank_transaction_id, Decimal("0")
-        ) + m.allocated_amount
+    allocations = await _active_match_sum(db, MatchLevel.LEVEL2)
+
+    # 只有已经执行过对账（产生过匹配或差异）的批次才参与残差归因；
+    # 刚摄入尚未对账的 OPEN 批次，其流水还没机会分配，不能提前误报为残差
+    reconciled_ids = set(
+        (await db.execute(
+            select(SettlementMatch.settlement_batch_id).where(
+                SettlementMatch.settlement_batch_id.is_not(None)
+            )
+        )).scalars().all()
+    )
+    reconciled_ids |= set(
+        (await db.execute(select(Discrepancy.batch_id))).scalars().all()
+    )
 
     open_batches = (
         await db.execute(select(SettlementBatch).where(SettlementBatch.status == "OPEN"))
@@ -351,7 +538,12 @@ async def _check_bank_residuals(db: AsyncSession) -> int:
         if residual <= TOLERANCE:
             continue
         for batch in open_batches:
+            if batch.id not in reconciled_ids:
+                continue
             if batch.channel != bank.channel or batch.currency != bank.currency:
+                continue
+            # 跨主体流水的残差走 CROSS_ENTITY 流程，不在同主体残差里重复提示
+            if batch.legal_entity != bank.legal_entity:
                 continue
             d = await _raise_discrepancy(
                 db, batch, DiscrepancyKind.UNKNOWN,
@@ -363,6 +555,12 @@ async def _check_bank_residuals(db: AsyncSession) -> int:
             )
             if d is not None:
                 created += 1
+                await _ensure_carry_forward(
+                    db, batch, "BANK_TRANSACTION", "RESIDUAL",
+                    residual, bank.currency,
+                    {"bank_ref": bank.bank_ref, "residual": str(residual)},
+                    bank_transaction_id=bank.id,
+                )
             break
     return created
 

@@ -218,6 +218,8 @@ class SettlementBatch(Base):
     currency: Mapped[str] = mapped_column(String(8), nullable=False)
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     status: Mapped[str] = mapped_column(String(10), nullable=False, default="OPEN")
+    # 结算主体（法人实体）：渠道结算单归属的收款主体，跨主体匹配禁止自动核销
+    legal_entity: Mapped[str] = mapped_column(String(50), nullable=False, default="ENTITY-M1")
     gross_amount: Mapped[Decimal] = mapped_column(AMT, nullable=False, default=Decimal("0"))
     fee_amount: Mapped[Decimal] = mapped_column(AMT, nullable=False, default=Decimal("0"))
     net_amount: Mapped[Decimal] = mapped_column(AMT, nullable=False, default=Decimal("0"))
@@ -275,6 +277,8 @@ class BankTransaction(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     bank_ref: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
     channel: Mapped[str] = mapped_column(String(30), nullable=False)
+    # 银行流水的实际收款主体；与结算单主体不一致即为跨主体，只能人工挂账处理
+    legal_entity: Mapped[str] = mapped_column(String(50), nullable=False, default="ENTITY-M1")
     currency: Mapped[str] = mapped_column(String(8), nullable=False)
     amount: Mapped[Decimal] = mapped_column(AMT, nullable=False)
     booked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -313,6 +317,26 @@ class SettlementMatch(Base):
     status: Mapped[str] = mapped_column(String(10), nullable=False, default="PROPOSED")
     # AUTO = 引擎建议；MANUAL = 财务确认/手工建立
     match_method: Mapped[str] = mapped_column(String(10), nullable=False, default="AUTO")
+    # 置信度（0~100）：自动建议按匹配依据评分；人工确认/建立固定 100
+    confidence: Mapped[Decimal | None] = mapped_column(Numeric(5, 2), nullable=True)
+    # 匹配依据：ORDER_REF_EXACT / CHANNEL_REF_EXACT / AMOUNT_EXACT / MERGED_GREEDY /
+    #          MANUAL_SELECTION / RATIO_SPLIT / DETAIL_SPLIT / CROSS_ENTITY_MANUAL ...
+    match_basis: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    # 依据明细（候选键、金额构成、拆分比例、跨主体说明等），人工确认时一并留痕
+    match_detail: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # 拆分规则：FULL / RATIO / DETAIL / CARRY_FORWARD
+    split_rule: Mapped[str] = mapped_column(String(20), nullable=False, default="FULL")
+    # 拆分挂账时指向原始匹配（部分匹配一行拆多笔的父记录）
+    parent_match_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("settlement_matches.id"), nullable=True
+    )
+    # 本笔消化的结转挂账记录（结转余额被后续匹配占用时回填）
+    carry_forward_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("match_carry_forwards.id"), nullable=True
+    )
+    # 人工确认留痕
+    confirmed_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    confirm_comment: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.clock_timestamp()
     )
@@ -322,6 +346,46 @@ class SettlementMatch(Base):
         Index("ix_match_line", "settlement_line_id"),
         Index("ix_match_bank", "bank_transaction_id"),
         Index("ix_match_event", "business_event_id"),
+        Index("ix_match_level_status", "match_level", "status"),
+    )
+
+
+class MatchCarryForward(Base):
+    """未匹配余额结转挂账：部分匹配后结算行/银行流水的剩余金额单独结转，不混入下一笔匹配。"""
+    __tablename__ = "match_carry_forwards"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    match_level: Mapped[str] = mapped_column(String(30), nullable=False)
+    batch_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("settlement_batches.id"), nullable=False
+    )
+    # 余额来源：SETTLEMENT_LINE（结算行未被流水完全覆盖）/ BANK_TRANSACTION（流水残差）
+    source_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    settlement_line_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("settlement_lines.id"), nullable=True
+    )
+    bank_transaction_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("bank_transactions.id"), nullable=True
+    )
+    # 结转金额恒为正，方向由 source_type 表达；跨主体挂账同样落这里
+    amount: Mapped[Decimal] = mapped_column(AMT, nullable=False)
+    currency: Mapped[str] = mapped_column(String(8), nullable=False)
+    # SHORT_FALL 入账不足 / RESIDUAL 流水残差 / PARTIAL_SPLIT 人工拆分余额 / CROSS_ENTITY 跨主体
+    reason: Mapped[str] = mapped_column(String(20), nullable=False)
+    status: Mapped[str] = mapped_column(String(10), nullable=False, default="OPEN")
+    detail: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    created_by: Mapped[str] = mapped_column(String(100), nullable=False)
+    resolved_match_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("settlement_matches.id"), nullable=True
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.clock_timestamp()
+    )
+
+    __table_args__ = (
+        Index("ix_cf_batch_status", "batch_id", "status"),
+        Index("ix_cf_source", "source_type", "settlement_line_id", "bank_transaction_id"),
     )
 
 

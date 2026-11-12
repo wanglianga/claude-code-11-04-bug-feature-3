@@ -37,7 +37,7 @@ services:
     ports:
       - "8080:80"
 
-  # 一键装载模拟数据（8 类场景 + 完整处置/更正/版本链）：
+  # 一键装载模拟数据（9 类场景 + 完整处置/更正/版本链 + 两层匹配工作台数据）：
   #   docker compose run --rm seed
   seed:
     build: ./backend

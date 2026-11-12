@@ -42,6 +42,7 @@ const menu = [
   { path: '/dashboard', label: '总览', icon: '▦' },
   { path: '/discrepancies', label: '财务处置队列', icon: '⚠' },
   { path: '/batches', label: '批次对账', icon: '⛓' },
+  { path: '/matching', label: '两层匹配工作台', icon: '⇄' },
   { path: '/events', label: '事件与账本', icon: '≣' },
   { path: '/reports', label: '月度报表版本', icon: '◷' },
 ]

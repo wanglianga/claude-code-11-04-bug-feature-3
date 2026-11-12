@@ -105,6 +105,21 @@ async def main(reset: bool = False) -> None:
             )
         ).scalar_one()
 
+        print("== 2b. S9 第二主体 ADYEN/M2 事件摄入（保证金/调整项/部分到账/跨主体） ==")
+        # 仅摄入事件与结算单；对账推迟到 M1 v1 关闭后，避免全局残差检查在
+        # M1 流水尚未分配时提前挂残差（匹配只由显式对账触发，摄入不产生匹配）
+        for ev in [*demo.m2_order_events(), *demo.m2_bank_events()]:
+            await _ingest(db, ev)
+        await _ingest(db, demo.settlement_m2_event())
+        await db.commit()
+        sb_m2 = (
+            await db.execute(
+                select(SettlementBatch).where(
+                    SettlementBatch.batch_ref == "SB-202610-M2"
+                )
+            )
+        ).scalar_one()
+
         print("== 3. 自动对账（引擎只生成建议，不核销） ==")
         r1 = await run_reconciliation(db, sb1.id)
         await db.commit()
@@ -117,6 +132,15 @@ async def main(reset: bool = False) -> None:
         closed1 = await close_batch(db, sb1.id, OPERATOR)
         await db.commit()
         print(f"   批次关闭：{closed1}")
+
+        print("== 4b. S9 M2 批次自动对账（只建议；总额相等但逐笔未完成） ==")
+        r_m2 = await run_reconciliation(db, sb_m2.id)
+        await db.commit()
+        print(
+            f"   M2 批次净额 {sb_m2.net_amount}，银行入账合计同样 280.00，"
+            f"逐笔完成=False；引擎差异：{json.dumps(r_m2['by_kind'], ensure_ascii=False)}，"
+            "跨主体流水未生成任何自动匹配（批次保持 OPEN，供两层匹配工作台演示）"
+        )
 
         print("== 5. 只追加保护验证（预期触发器报错） ==")
         try:

@@ -10,7 +10,7 @@ FastAPI + PostgreSQL（四层数据架构）+ Vue 3，解决重复记账、乱�
 |---|---|---|
 | L1 原始事件层 | `raw_events` | CDC/webhook/轮询/人工消息原样留存，`(source, idempotency_key)` 去重 |
 | L2 标准业务账本层 | `business_events` `ledger_entries` `fx_rates` `order_states` `payment_states` | 归一化业务事件、双分录三币种账本、历史汇率版本、按业务时间重放的状态投影 |
-| L3 结算匹配层 | `settlement_batches/lines` `bank_transactions` `settlement_matches` `discrepancies(+actions)` | 两层匹配、五类差异、人工处置工作流 |
+| L3 结算匹配层 | `settlement_batches/lines` `bank_transactions` `settlement_matches` `match_carry_forwards` `discrepancies(+actions)` | 两层匹配、五类差异、拆分/合并/结转、跨主体拦截、人工处置工作流 |
 | L4 月度汇总层 | `monthly_reports` `monthly_report_versions` | 不可变快照与版本链，更正只追加新版本 |
 
 关键机制：
@@ -19,6 +19,17 @@ FastAPI + PostgreSQL（四层数据架构）+ Vue 3，解决重复记账、乱�
 - **三币种留痕**：每笔金额保留交易币、结算币、记账币，以及汇率来源、适用时点、精度规则和原始金额。
 - **只追加账本**：6 张证据表由 PostgreSQL 触发器拒绝 UPDATE/DELETE/TRUNCATE（详见 `db/DATA_LAYER.md`）。
 - **自动任务只提示**：对账引擎只生成 `PROPOSED` 匹配与 `OPEN` 差异；`UNKNOWN` 未知差必须人工调账留痕后才能关闭。
+- **两层人工匹配工作台**（前端“两层匹配工作台”页，API 前缀 `/api/matching`）：
+  - 先确认 **LEVEL1 订单→结算行**，再确认 **LEVEL2 结算行→银行流水**；页面区分捕获/退款/拒付、
+    手续费、保证金（RESERVE/RESERVE_RELEASE）与调整项（ADJUSTMENT），成分行不参与订单匹配；
+  - 每条自动建议带**匹配依据与置信度**（订单号精确 95、渠道号回退 75、金额精确 90、合并贪心 60），
+    人工确认/建立固定置信度 100 并记录确认人与说明；
+  - **总额相等不等于逐笔完成**：完成态按每条结算行/流水的有效 CONFIRMED 分配与未结转余额逐笔判定，
+    批次净额与银行入账合计相等但存在建议/跨主体/挂账时页面显式警示“总额相等陷阱”；
+  - 部分匹配支持 **RATIO 按金额比例**（尾差并入末行）与 **DETAIL 指定明细** 拆分挂账，
+    未匹配余额写入 `match_carry_forwards` 单独结转（SHORT_FALL/RESIDUAL/PARTIAL_SPLIT/CROSS_ENTITY）；
+  - **跨主体不自动核销**：`legal_entity` 不一致的银行流水引擎不生成任何匹配，只提示 UNKNOWN 并挂账，
+    人工核销必须显式勾选确认，留痕 `CROSS_ENTITY_MANUAL`；建议可拒收（REJECTED 留痕、额度释放）。
 - **关闭后更正**：结算修订、汇率更正、补单一律追加更正账与新报表版本，旧快照标记 `SUPERSEDED` 但原样保留。
 
 ## 二、一键启动（Docker Compose，推荐）
@@ -28,7 +39,7 @@ FastAPI + PostgreSQL（四层数据架构）+ Vue 3，解决重复记账、乱�
 ```bash
 cd /workspace/04
 docker compose up -d --build          # 启动 db / backend / frontend
-docker compose run --rm seed          # 装载 8 类模拟场景并跑完整处置/更正/版本链
+docker compose run --rm seed          # 装载 9 类模拟场景并跑完整处置/更正/版本链
 ```
 
 访问：
@@ -85,7 +96,7 @@ cd backend && source .venv/bin/activate
 export RECON_DATABASE_URL="postgresql+asyncpg://recon:recon@<host>:5432/recon"
 bash scripts/verify.sh        # = pytest 全套 + seed 端到端
 # 或分步：
-python -m pytest tests/ -q    # 27 个用例
+python -m pytest tests/ -q    # 38 个用例
 python scripts/seed.py --reset
 ```
 
@@ -99,21 +110,31 @@ python scripts/seed.py --reset
 | `test_05_workflow.py` | 认领/附件/调账建议/过账/关闭轨迹、关闭前置校验、快照生成 |
 | `test_06_corrections.py` | 结算修订新版本、汇率更正账、报表版本链、历史快照不被改写、关闭后补单 |
 | `test_07_append_only.py` | UPDATE/DELETE/TRUNCATE 触发器、证据列不可改、生命周期列可改 |
+| `test_08_matching_workspace.py` | 总额相等陷阱、置信度/依据留痕、跨主体拦截与人工 ack、比例/明细拆分、结转挂账、拒收释放、成分行保护 |
 
 ### 5.2 模拟场景（`backend/app/demo/events.py`，结算周期 2026-10）
 S1 CDC 重放 · S2 webhook 乱序与状态回退防护 · S3 支付后延迟入账（11-15 才到银行）·
 S4 部分退款（ORD-005 退 40/100）· S5 拒付反转（ORD-006）· S6 结算单修订 v1→v2（手续费后补）·
 S7 汇率更正 USD/CNY 7.20→7.25 · S8 多笔合并银行入账；另含金额差（ORD-007）、汇率差（ORD-009 EUR）、
 幽灵结算行与银行残差两类未知差、关闭周期补单。
+S9 第二主体 ADYEN/M2 批次 `SB-202610-M2`：保证金扣留行（RESERVE -15）与调整项行（ADJUSTMENT -5）、
+部分到账（BK-M2-1 仅 200/280）、跨主体流水（BK-M2-2 收款主体 ENTITY-M1）；
+两笔流水合计 280 恰好等于批次净额，但逐笔匹配**不得**标记完成——“总额相等陷阱”的固定演示数据。
 
 ### 5.3 本环境实际执行过的验证（结论如实记录）
-- `python -m pytest tests/ -q`：**27 passed**（用户态 PostgreSQL 15，端口 5433）。
+- `python -m pytest tests/ -q`：**38 passed**（用户态 PostgreSQL 15，端口 5433）。
 - `python scripts/seed.py --reset`：端到端跑通，31 条原始消息中 2 条重复被丢弃、生成 28 个业务事件；
-  v1 批次产生 5 类差异共 5 条并全部人工处置关闭；最终生成 4 个报表版本（v1~v3 SUPERSEDED、v4 CURRENT），
-  全账本借贷各 17,898.31 CNY 平衡；只追加触发器成功拦截 UPDATE/DELETE。
-- API 冒烟：`/health`、`/api/ledger/balances`、`/api/batches`、`/api/reports/1/versions`、
-  重复摄入同一消息返回 `duplicate=true` 且账本无变化，均验证通过。
-- 前端 `npm run build` 构建成功；Vite dev server + `/api` 代理联调返回真实数据。
+  v1 批次产生 5 条差异（AMOUNT/FX/TIMING 各 1、UNKNOWN 2）并全部人工处置关闭；
+  S9 的 M2 批次对账产生 2 条 UNKNOWN（跨主体 + 入账不足）并保持 OPEN 供工作台演示；
+  最终生成 4 个报表版本（v1~v3 SUPERSEDED、v4 CURRENT），
+  全账本借贷各 22,248.32 CNY 平衡；只追加触发器成功拦截 UPDATE/DELETE。
+- 两层匹配工作台 API 冒烟（真实 HTTP 调用）：
+  工作台返回 `bank_inflow_equals_net=true` 且 `complete=false` 的总额相等陷阱；
+  3 条 LEVEL1 建议人工确认后置信度 100、依据与确认人留痕；
+  跨主体手工匹配未勾选 ack 返回 400 拦截，勾选后落 `CROSS_ENTITY_MANUAL`；
+  拒收 PROPOSED 建议后 RATIO 比例拆分 200 → 109.09/90.91（尾差并入末行），
+  两行余额 7.91/6.59 自动结转挂账；重跑对账后引擎 SHORT_FALL 挂账自动 RESOLVED、人工 PARTIAL_SPLIT 挂账保留。
+- 前端 `npm run build` 构建成功（91 modules）；Vite dev server + `/api` 代理联调返回真实数据。
 - 说明：本环境无 Docker 守护进程，**未实际执行镜像构建**，Dockerfile/compose 已按标准编写并通过 YAML 校验，
   请在具备 Docker 的环境按第二节验证。
 
@@ -129,6 +150,11 @@ S7 汇率更正 USD/CNY 7.20→7.25 · S8 多笔合并银行入账；另含金�
 | POST | `/api/reconcile/run-all` | 自动对账（只生成建议） |
 | GET/POST | `/api/batches`、`/api/batches/{id}/reconcile|close|snapshot` | 批次对账与关闭 |
 | GET/POST | `/api/matches`、`/api/matches/{id}/confirm` | 两层匹配与人工确认 |
+| GET | `/api/matching/workspace/{batch_id}` | 两层匹配工作台聚合视图（逐笔状态/成分行/结转/总额相等判定） |
+| POST | `/api/matching/matches/{id}/confirm|reject` | 人工确认（跨主体须 ack）/ 拒收自动建议 |
+| POST | `/api/matching/level1/manual` | 手工订单事件→结算行（MANUAL_SELECTION，置信度 100） |
+| POST | `/api/matching/level2/manual` | 手工结算行→银行流水（FULL/RATIO/DETAIL 拆分、结转、跨主体 ack） |
+| GET | `/api/matching/carry-forwards` | 未匹配余额结转挂账 |
 | GET/POST | `/api/discrepancies`、`/{id}/claim|attach|adjust-suggest|adjust-post|close` | 差异处置队列 |
 | GET | `/api/reports`、`/api/reports/{id}/versions` | 月度报表与版本快照 |
 | POST | `/api/reports/regenerate` | 关闭周期补单后重算新版本 |
@@ -145,14 +171,15 @@ S7 汇率更正 USD/CNY 7.20→7.25 · S8 多笔合并银行入账；另含金�
 │   │   ├── services/
 │   │   │   ├── ledger.py        # 幂等摄入、双分录、状态投影
 │   │   │   ├── fx.py            # 历史汇率时点取值
-│   │   │   ├── reconciliation.py# 两层匹配与五类差异引擎
+│   │   │   ├── reconciliation.py# 两层匹配与五类差异引擎（建议/跨主体拦截/结转）
+│   │   │   ├── matching.py      # 人工匹配工作台：确认/拒收/拆分挂账/结转留痕
 │   │   │   ├── workflow.py      # 人工处置与批次关闭
 │   │   │   └── corrections.py   # 更正账与报表版本
-│   │   ├── routers/             # events / reconciliation API
-│   │   └── demo/                # 8 类模拟事件与场景装载器
-│   ├── tests/                   # 27 个 pytest 验收用例
+│   │   ├── routers/             # events / reconciliation / matching API
+│   │   └── demo/                # 9 类模拟事件与场景装载器
+│   ├── tests/                   # 38 个 pytest 验收用例
 │   └── scripts/seed.py verify.sh
-├── frontend/                    # Vue 3 + Vite + vue-router + axios
+├── frontend/                    # Vue 3 + Vite + vue-router + axios（含两层匹配工作台页）
 ├── db/DATA_LAYER.md             # 数据层与触发器设计说明
 └── docker-compose.yml           # db + backend + frontend(+seed profile)
 ```

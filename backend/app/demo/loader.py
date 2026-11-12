@@ -48,6 +48,29 @@ async def load_base_events(db: AsyncSession) -> dict:
     return {"counts": counts, "batch": batch}
 
 
+async def load_m2_batch(db: AsyncSession, run_reconcile: bool = True) -> SettlementBatch:
+    """S9：装载第二主体 ADYEN/M2 批次（保证金/调整项/部分到账/跨主体）并跑自动建议。"""
+    # 独立场景：先确保三币种换算所需的历史汇率已存在（重复摄入由两层幂等丢弃）
+    for ev in demo.fx_events():
+        await ingest(db, ev)
+    for ev in [*demo.m2_order_events(), *demo.m2_bank_events()]:
+        await ingest(db, ev)
+    await ingest(db, demo.settlement_m2_event())
+    await db.commit()
+    batch = (
+        await db.execute(
+            select(SettlementBatch).where(
+                SettlementBatch.batch_ref == "SB-202610-M2"
+            )
+        )
+    ).scalar_one()
+    if run_reconcile:
+        from ..services.reconciliation import run_reconciliation as _run
+        await _run(db, batch.id)
+        await db.commit()
+    return batch
+
+
 async def resolve_and_close(db: AsyncSession, batch: SettlementBatch) -> dict:
     """阶段 2：人工处置全部差异并关闭批次。"""
     result = await run_reconciliation(db, batch.id)

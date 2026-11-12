@@ -382,6 +382,7 @@ async def _h_settlement(db: AsyncSession, be: BusinessEvent, p: dict) -> None:
         currency=p["currency"],
         version=version,
         status="OPEN",
+        legal_entity=p.get("legal_entity", "ENTITY-M1"),
         gross_amount=Decimal(str(p["gross_amount"])),
         fee_amount=Decimal(str(p["fee_amount"])),
         net_amount=Decimal(str(p["net_amount"])),
@@ -408,6 +409,7 @@ async def _h_bank_deposit(db: AsyncSession, be: BusinessEvent, p: dict) -> None:
     db.add(BankTransaction(
         bank_ref=p["bank_ref"],
         channel=p["channel"],
+        legal_entity=p.get("legal_entity", "ENTITY-M1"),
         currency=p["currency"],
         amount=Decimal(str(p["amount"])),
         booked_at=_dt(p["booked_at"]),
