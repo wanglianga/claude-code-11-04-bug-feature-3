@@ -292,14 +292,21 @@ async def _ensure_carry_forward(
     bank_transaction_id: int | None = None,
     created_by: str = "reconcile-engine",
 ) -> None:
-    """幂等登记未匹配余额结转挂账：同来源+同原因+OPEN 已存在则不重复建。"""
+    """幂等登记未匹配余额结转挂账。
+
+    同一余额身份（批次 + 来源类型 + 同一流水/结算行）只保留一笔 OPEN 挂账：
+      - 已存在则把挂账金额同步为当前实际未结金额（部分核销后原挂账必须扣减，
+        不能保留旧金额再新增一笔，否则同一余额被重复列示）；
+      - 不区分登记原因（CROSS_ENTITY/RESIDUAL/PARTIAL_SPLIT 描述的是同一笔残差），
+        保留原挂账的原因与登记人，只更新金额与明细；
+      - 历史上已产生的同身份重复 OPEN 挂账，保留首笔并结清其余。
+    """
     from ..models import MatchCarryForward
     if amount <= TOLERANCE:
         return
     stmt = select(MatchCarryForward).where(
         MatchCarryForward.batch_id == batch.id,
         MatchCarryForward.source_type == source_type,
-        MatchCarryForward.reason == reason,
         MatchCarryForward.status == "OPEN",
     )
     # 可空外键：NULL 用 IS NULL，非空用 = 绑定参数（IS $n 不是合法 SQL）
@@ -311,15 +318,30 @@ async def _ensure_carry_forward(
         stmt = stmt.where(MatchCarryForward.bank_transaction_id.is_(None))
     else:
         stmt = stmt.where(MatchCarryForward.bank_transaction_id == bank_transaction_id)
-    existed = (await db.execute(stmt)).scalar_one_or_none()
-    if existed is not None:
+    existed = (
+        await db.execute(stmt.order_by(MatchCarryForward.id))
+    ).scalars().all()
+    amount = quantize(amount)
+    if not existed:
+        db.add(MatchCarryForward(
+            match_level=MatchLevel.LEVEL2, batch_id=batch.id, source_type=source_type,
+            settlement_line_id=settlement_line_id, bank_transaction_id=bank_transaction_id,
+            amount=amount, currency=currency, reason=reason,
+            status="OPEN", detail=detail, created_by=created_by,
+        ))
         return
-    db.add(MatchCarryForward(
-        match_level=MatchLevel.LEVEL2, batch_id=batch.id, source_type=source_type,
-        settlement_line_id=settlement_line_id, bank_transaction_id=bank_transaction_id,
-        amount=quantize(amount), currency=currency, reason=reason,
-        status="OPEN", detail=detail, created_by=created_by,
-    ))
+    primary, duplicates = existed[0], existed[1:]
+    if quantize(primary.amount - amount) > TOLERANCE or quantize(amount - primary.amount) > TOLERANCE:
+        primary.amount = amount
+        primary.detail = {
+            **primary.detail, **detail,
+            "resynced_by": created_by,
+            "resynced_amount": str(amount),
+        }
+    for dup in duplicates:
+        dup.status = "RESOLVED"
+        dup.resolved_at = datetime.now(timezone.utc)
+        dup.detail = {**dup.detail, "dedup_resolved_in_favor_of": primary.id}
 
 
 async def _reconcile_level2(db: AsyncSession, batch: SettlementBatch) -> int:
@@ -475,21 +497,63 @@ async def _reconcile_level2(db: AsyncSession, batch: SettlementBatch) -> int:
 
 
 async def _settle_engine_carries(db: AsyncSession, batch: SettlementBatch) -> None:
-    """重跑对账时结清已不复存在的引擎挂账：人工建立的 PARTIAL_SPLIT/跨主体挂账不动。"""
+    """重跑对账时把挂账与真实未结余额对齐：
+
+    无论挂账由引擎还是人工动作登记，OPEN 挂账金额都必须等于当前实际未结金额；
+    残差/缺口已消失则结清挂账，部分核销后则把金额同步为剩余余额，
+    杜绝“原挂账不扣减、另挂一笔”造成的重复列示。
+    """
     from ..models import MatchCarryForward
     rows = (
         await db.execute(
             select(MatchCarryForward).where(
                 MatchCarryForward.batch_id == batch.id,
                 MatchCarryForward.status == "OPEN",
-                MatchCarryForward.created_by == "reconcile-engine",
             )
         )
     ).scalars().all()
     allocations = await _active_match_sum(db, MatchLevel.LEVEL2)
+    line_alloc_rows = (
+        await db.execute(
+            select(SettlementMatch).where(
+                SettlementMatch.match_level == MatchLevel.LEVEL2,
+                SettlementMatch.settlement_line_id.is_not(None),
+                SettlementMatch.status != MatchStatus.REJECTED,
+            )
+        )
+    ).scalars().all()
+    line_allocs: dict[int, Decimal] = {}
+    for m in line_alloc_rows:
+        line_allocs[m.settlement_line_id] = (
+            line_allocs.get(m.settlement_line_id, Decimal("0")) + m.allocated_amount
+        )
     for cf in rows:
-        if cf.reason == "SHORT_FALL":
-            # 批次缺口已被后续流水覆盖
+        if cf.bank_transaction_id is not None:
+            bank = await db.get(BankTransaction, cf.bank_transaction_id)
+            if bank is None:
+                continue
+            residual = quantize(
+                bank.amount - allocations.get(bank.id, Decimal("0"))
+            )
+            if residual <= TOLERANCE:
+                cf.status = "RESOLVED"
+                cf.resolved_at = datetime.now(timezone.utc)
+            elif abs(quantize(cf.amount - residual)) > TOLERANCE:
+                cf.amount = residual
+        elif cf.settlement_line_id is not None:
+            line = await db.get(SettlementLine, cf.settlement_line_id)
+            if line is None:
+                continue
+            remaining = quantize(
+                line.net_amount - line_allocs.get(line.id, Decimal("0"))
+            )
+            if remaining <= TOLERANCE:
+                cf.status = "RESOLVED"
+                cf.resolved_at = datetime.now(timezone.utc)
+            elif abs(quantize(cf.amount - remaining)) > TOLERANCE:
+                cf.amount = remaining
+        else:
+            # 批次级缺口挂账（SHORT_FALL，不绑定具体行/流水）
             active_batch = quantize(sum(
                 (m.allocated_amount for m in (await db.execute(
                     select(SettlementMatch).where(
@@ -501,13 +565,6 @@ async def _settle_engine_carries(db: AsyncSession, batch: SettlementBatch) -> No
                 Decimal("0"),
             ))
             if quantize(batch.net_amount - active_batch) <= TOLERANCE:
-                cf.status = "RESOLVED"
-                cf.resolved_at = datetime.now(timezone.utc)
-        elif cf.reason == "RESIDUAL" and cf.bank_transaction_id:
-            bank = await db.get(BankTransaction, cf.bank_transaction_id)
-            if bank is not None and quantize(
-                bank.amount - allocations.get(bank.id, Decimal("0"))
-            ) <= TOLERANCE:
                 cf.status = "RESOLVED"
                 cf.resolved_at = datetime.now(timezone.utc)
 

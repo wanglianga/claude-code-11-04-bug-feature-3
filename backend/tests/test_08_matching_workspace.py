@@ -321,3 +321,164 @@ async def test_carry_forward_consumed_by_later_manual_match(db):
     cf = await db.get(MatchCarryForward, cross_cf["id"])
     assert cf.status == "RESOLVED"
     assert cf.resolved_match_id == created[0].id
+
+
+async def _bank_carries(db, batch_id: int, bank_transaction_id: int):
+    return list(
+        (
+            await db.execute(
+                select(MatchCarryForward)
+                .where(
+                    MatchCarryForward.batch_id == batch_id,
+                    MatchCarryForward.source_type == "BANK_TRANSACTION",
+                    MatchCarryForward.bank_transaction_id == bank_transaction_id,
+                )
+                .order_by(MatchCarryForward.id)
+            )
+        ).scalars().all()
+    )
+
+
+async def test_partial_cross_entity_writeoff_deducts_existing_carry_forward(db):
+    """跨主体流水部分核销后刷新：原挂账按核销额扣减，不新增同余额挂账。
+
+    复现路径：工作台对 BK-M2-2（引擎已登记 80 的 CROSS_ENTITY 挂账）只核销 30，
+    不关联既有挂账（前端默认“不关联”），随后刷新工作台、重跑自动对账。
+    """
+    batch, ws = await _workspace(db)
+    bank = next(b for b in ws["level2"]["banks"] if b["bank_ref"] == "BK-M2-2")
+    original_cf = next(cf for cf in ws["carry_forwards"] if cf["reason"] == "CROSS_ENTITY")
+    assert Decimal(original_cf["amount"]) == Decimal("80.00")
+    line = (await db.execute(
+        select(SettlementLine).where(
+            SettlementLine.batch_id == batch.id,
+            SettlementLine.line_ref == "L-M2-003",
+        )
+    )).scalar_one()
+
+    await svc.create_manual_level2(
+        db, batch.id, bank["bank_transaction_id"],
+        [{"settlement_line_id": line.id, "amount": "30.00"}],
+        SplitRule.DETAIL, OPERATOR, "跨主体流水先核销一部分",
+        acknowledge_cross_entity=True,
+    )
+    await db.commit()
+
+    # 刷新工作台（不重跑引擎）：同一流水只剩一笔 OPEN 挂账，金额=实际残差 50
+    ws = await svc.get_workspace(db, batch.id)
+    bank_view = next(b for b in ws["level2"]["banks"]
+                     if b["bank_transaction_id"] == bank["bank_transaction_id"])
+    assert Decimal(bank_view["residual_amount"]) == Decimal("50.00")
+    open_rows = [c for c in ws["carry_forwards"]
+                 if c["status"] == "OPEN" and c["bank_ref"] == "BK-M2-2"]
+    assert len(open_rows) == 1
+    assert Decimal(open_rows[0]["amount"]) == Decimal("50.00")
+    # 原挂账被原地扣减而非新增：ID 不变、原因与登记人保留、状态仍 OPEN
+    assert open_rows[0]["id"] == original_cf["id"]
+    assert open_rows[0]["reason"] == "CROSS_ENTITY"
+    assert open_rows[0]["created_by"] == "reconcile-engine"
+
+    rows = await _bank_carries(db, batch.id, bank["bank_transaction_id"])
+    assert len(rows) == 1
+    assert rows[0].id == original_cf["id"]
+    assert rows[0].status == "OPEN"
+    assert Decimal(rows[0].amount) == Decimal("50.00")
+
+    # 再次刷新结果稳定（不随读取产生新挂账）
+    ws_again = await svc.get_workspace(db, batch.id)
+    again_rows = [c for c in ws_again["carry_forwards"]
+                  if c["status"] == "OPEN" and c["bank_ref"] == "BK-M2-2"]
+    assert [c["id"] for c in again_rows] == [original_cf["id"]]
+
+    # 重跑自动对账后仍只有一笔 50 的挂账，引擎不得复活或新增
+    await run_reconciliation(db, batch.id)
+    await db.commit()
+    rows = await _bank_carries(db, batch.id, bank["bank_transaction_id"])
+    open_rows = [r for r in rows if r.status == "OPEN"]
+    assert len(open_rows) == 1
+    assert open_rows[0].id == original_cf["id"]
+    assert Decimal(open_rows[0].amount) == Decimal("50.00")
+
+
+async def test_remaining_writeoff_resolves_deducted_carry_forward(db):
+    """扣减后的挂账被后续核销全额覆盖时结清，未匹配列表不再展示该流水。"""
+    batch, ws = await _workspace(db)
+    bank = next(b for b in ws["level2"]["banks"] if b["bank_ref"] == "BK-M2-2")
+
+    async def _line():
+        return (await db.execute(
+            select(SettlementLine).where(
+                SettlementLine.batch_id == batch.id,
+                SettlementLine.line_ref == "L-M2-003",
+            )
+        )).scalar_one()
+
+    await svc.create_manual_level2(
+        db, batch.id, bank["bank_transaction_id"],
+        [{"settlement_line_id": (await _line()).id, "amount": "30.00"}],
+        SplitRule.DETAIL, OPERATOR, "第一次部分核销",
+        acknowledge_cross_entity=True,
+    )
+    await db.commit()
+    await svc.create_manual_level2(
+        db, batch.id, bank["bank_transaction_id"],
+        [{"settlement_line_id": (await _line()).id, "amount": "50.00"}],
+        SplitRule.DETAIL, OPERATOR, "核销剩余全部残差",
+        acknowledge_cross_entity=True,
+    )
+    await db.commit()
+
+    rows = await _bank_carries(db, batch.id, bank["bank_transaction_id"])
+    assert len(rows) == 1
+    assert rows[0].status == "RESOLVED"
+    ws = await svc.get_workspace(db, batch.id)
+    bank_view = next(b for b in ws["level2"]["banks"]
+                     if b["bank_transaction_id"] == bank["bank_transaction_id"])
+    assert Decimal(bank_view["residual_amount"]) == Decimal("0.00")
+    assert [c for c in ws["carry_forwards"]
+            if c["status"] == "OPEN" and c["bank_ref"] == "BK-M2-2"] == []
+
+
+async def test_repeated_partial_writeoffs_update_single_carry_forward(db):
+    """同主体流水多次部分核销：挂账随每次核销原地更新，不重复登记。"""
+    batch, ws = await _workspace(db)
+    bank = next(b for b in ws["level2"]["banks"] if b["bank_ref"] == "BK-M2-1")
+
+    async def _line():
+        return (await db.execute(
+            select(SettlementLine).where(
+                SettlementLine.batch_id == batch.id,
+                SettlementLine.line_ref == "L-M2-001",
+            )
+        )).scalar_one()
+
+    await svc.create_manual_level2(
+        db, batch.id, bank["bank_transaction_id"],
+        [{"settlement_line_id": (await _line()).id, "amount": "50.00"}],
+        SplitRule.DETAIL, OPERATOR, "同主体首次部分核销",
+    )
+    await db.commit()
+    first = await _bank_carries(db, batch.id, bank["bank_transaction_id"])
+    assert len(first) == 1
+    assert first[0].reason == "PARTIAL_SPLIT"
+    assert Decimal(first[0].amount) == Decimal("150.00")
+
+    await svc.create_manual_level2(
+        db, batch.id, bank["bank_transaction_id"],
+        [{"settlement_line_id": (await _line()).id, "amount": "50.00"}],
+        SplitRule.DETAIL, OPERATOR, "同主体二次部分核销",
+    )
+    await db.commit()
+    second = await _bank_carries(db, batch.id, bank["bank_transaction_id"])
+    assert len(second) == 1
+    assert second[0].id == first[0].id
+    assert second[0].status == "OPEN"
+    assert Decimal(second[0].amount) == Decimal("100.00")
+
+    ws = await svc.get_workspace(db, batch.id)
+    bank_view = next(b for b in ws["level2"]["banks"]
+                     if b["bank_transaction_id"] == bank["bank_transaction_id"])
+    open_rows = [c for c in ws["carry_forwards"]
+                 if c["status"] == "OPEN" and c["bank_ref"] == "BK-M2-1"]
+    assert len(open_rows) == 1
+    assert Decimal(open_rows[0]["amount"]) == Decimal(bank_view["residual_amount"]) == Decimal("100.00")

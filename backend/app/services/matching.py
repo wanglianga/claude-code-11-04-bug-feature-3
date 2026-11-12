@@ -574,6 +574,46 @@ async def _line_remaining(db: AsyncSession, line: SettlementLine) -> Decimal:
     return quantize(line.net_amount - used)
 
 
+async def _open_bank_carry_forwards(
+    db: AsyncSession, batch_id: int, bank_transaction_id: int,
+) -> list[MatchCarryForward]:
+    """该流水在本批次下全部 OPEN 的流水级结转挂账（按登记时间排序）。"""
+    return list(
+        (
+            await db.execute(
+                select(MatchCarryForward)
+                .where(
+                    MatchCarryForward.batch_id == batch_id,
+                    MatchCarryForward.source_type == "BANK_TRANSACTION",
+                    MatchCarryForward.bank_transaction_id == bank_transaction_id,
+                    MatchCarryForward.status == CarryForwardStatus.OPEN,
+                )
+                .order_by(MatchCarryForward.id)
+            )
+        ).scalars().all()
+    )
+
+
+async def _open_line_carry_forwards(
+    db: AsyncSession, batch_id: int, settlement_line_id: int,
+) -> list[MatchCarryForward]:
+    """该结算行在本批次下全部 OPEN 的行级结转挂账（按登记时间排序）。"""
+    return list(
+        (
+            await db.execute(
+                select(MatchCarryForward)
+                .where(
+                    MatchCarryForward.batch_id == batch_id,
+                    MatchCarryForward.source_type == "SETTLEMENT_LINE",
+                    MatchCarryForward.settlement_line_id == settlement_line_id,
+                    MatchCarryForward.status == CarryForwardStatus.OPEN,
+                )
+                .order_by(MatchCarryForward.id)
+            )
+        ).scalars().all()
+    )
+
+
 async def create_manual_level2(
     db: AsyncSession, batch_id: int, bank_transaction_id: int,
     items: list[dict], split_rule: str, operator: str, comment: str | None,
@@ -760,22 +800,50 @@ async def create_manual_level2(
         created.append(m)
         group_total += amt
 
-    # 结转挂账被消化：分配金额不得超过挂账余额，全额覆盖时关闭挂账
-    if cf is not None:
-        if group_total - cf.amount > TOLERANCE:
+    # 结转挂账被消化：
+    # 显式选中的挂账优先，连同该流水其它 OPEN 挂账（如引擎登记的跨主体/残差挂账）
+    # 一并按本次核销金额顺序扣减，避免“原挂账不扣减、又新增一笔挂账”的重复列示；
+    # 单笔挂账全额覆盖才 RESOLVED，部分核销保持 OPEN 并只保留实际未结余额。
+    if cf is not None or group_total > TOLERANCE:
+        linked = await _open_bank_carry_forwards(db, batch_id, bank.id)
+        ordered = ([cf] if cf is not None else []) + [
+            c for c in linked if cf is None or c.id != cf.id
+        ]
+        if cf is not None and group_total - cf.amount > TOLERANCE:
             raise MatchingError(
                 f"分配金额 {group_total} 超过结转挂账金额 {cf.amount}"
             )
-        if quantize(cf.amount - group_total) <= TOLERANCE:
-            cf.status = CarryForwardStatus.RESOLVED
-            cf.resolved_match_id = parent_id
-            cf.resolved_at = _now()
-        cf.detail = {**cf.detail, "partially_consumed_by": group_ref,
-                     "consumed_amount": str(group_total)}
+        to_consume = group_total
+        for carry in ordered:
+            if to_consume <= TOLERANCE:
+                break
+            take = min(carry.amount, to_consume)
+            new_amount = quantize(carry.amount - take)
+            carry.detail = {
+                **carry.detail,
+                "partially_consumed_by": group_ref,
+                "consumed_amount": str(take),
+                "remaining_amount": str(new_amount),
+            }
+            if new_amount <= TOLERANCE:
+                carry.status = CarryForwardStatus.RESOLVED
+                carry.resolved_match_id = parent_id
+                carry.resolved_at = _now()
+            else:
+                carry.amount = new_amount
+            to_consume = quantize(to_consume - take)
 
-    # 未匹配余额单独结转：流水残差 / 结算行缺口
+    # 未匹配余额单独结转：流水残差 / 结算行缺口。
+    # 该流水已存在 OPEN 挂账时（含被部分核销后剩余的挂账），残差已由原挂账表达，
+    # 不再新增同来源挂账，只在没有任何挂账时登记一笔；残差归零则结清挂账。
     new_bank_remaining = await _bank_remaining(db, bank)
-    if new_bank_remaining > TOLERANCE and cf is None:
+    existing_bank_carries = await _open_bank_carry_forwards(db, batch_id, bank.id)
+    if new_bank_remaining <= TOLERANCE:
+        for carry in existing_bank_carries:
+            carry.status = CarryForwardStatus.RESOLVED
+            carry.resolved_match_id = parent_id
+            carry.resolved_at = _now()
+    elif not existing_bank_carries:
         db.add(MatchCarryForward(
             match_level=MatchLevel.LEVEL2, batch_id=batch_id,
             source_type="BANK_TRANSACTION", reason="PARTIAL_SPLIT",
@@ -788,16 +856,79 @@ async def create_manual_level2(
         ))
     for line, amt in allocations:
         rem = await _line_remaining(db, line)
-        if rem > TOLERANCE:
-            db.add(MatchCarryForward(
-                match_level=MatchLevel.LEVEL2, batch_id=batch_id,
-                source_type="SETTLEMENT_LINE", reason="PARTIAL_SPLIT",
-                settlement_line_id=line.id,
-                amount=rem, currency=line.currency,
-                status=CarryForwardStatus.OPEN,
-                detail={"line_ref": line.line_ref, "group_ref": group_ref,
-                        "remaining": str(rem)},
-                created_by=operator,
-            ))
+        line_carries = await _open_line_carry_forwards(db, batch_id, line.id)
+        if rem <= TOLERANCE:
+            # 后续核销已覆盖该行全部缺口：历史挂账结清，不留 stale OPEN
+            for carry in line_carries:
+                carry.status = CarryForwardStatus.RESOLVED
+                carry.resolved_match_id = parent_id
+                carry.resolved_at = _now()
+            continue
+        # 同一结算行已有 OPEN 挂账时，仅把挂账金额更新为实际未结余额，不重复登记
+        if line_carries:
+            primary = line_carries[0]
+            primary.amount = rem
+            primary.detail = {
+                **primary.detail, "group_ref": group_ref,
+                "remaining": str(rem),
+                "partially_consumed_by": group_ref,
+            }
+            for extra in line_carries[1:]:
+                extra.status = CarryForwardStatus.RESOLVED
+                extra.resolved_match_id = parent_id
+                extra.resolved_at = _now()
+            continue
+        db.add(MatchCarryForward(
+            match_level=MatchLevel.LEVEL2, batch_id=batch_id,
+            source_type="SETTLEMENT_LINE", reason="PARTIAL_SPLIT",
+            settlement_line_id=line.id,
+            amount=rem, currency=line.currency,
+            status=CarryForwardStatus.OPEN,
+            detail={"line_ref": line.line_ref, "group_ref": group_ref,
+                    "remaining": str(rem)},
+            created_by=operator,
+        ))
+
+    # 批次级缺口挂账（SHORT_FALL，不绑定具体行）即时对齐：
+    # 手工核销也占用批次额度，刷新工作台（不重跑引擎）时挂账金额即等于真实缺口
+    batch_rows = (
+        await db.execute(
+            select(SettlementMatch).where(
+                SettlementMatch.match_level == MatchLevel.LEVEL2,
+                SettlementMatch.settlement_batch_id == batch_id,
+                SettlementMatch.status != MatchStatus.REJECTED,
+            )
+        )
+    ).scalars().all()
+    batch_allocated = quantize(sum(
+        (m.allocated_amount for m in batch_rows), Decimal("0")
+    ))
+    batch_remaining = quantize(batch.net_amount - batch_allocated)
+    shortfall_carries = list(
+        (
+            await db.execute(
+                select(MatchCarryForward)
+                .where(
+                    MatchCarryForward.batch_id == batch_id,
+                    MatchCarryForward.source_type == "SETTLEMENT_LINE",
+                    MatchCarryForward.settlement_line_id.is_(None),
+                    MatchCarryForward.status == CarryForwardStatus.OPEN,
+                )
+                .order_by(MatchCarryForward.id)
+            )
+        ).scalars().all()
+    )
+    for idx, carry in enumerate(shortfall_carries):
+        if batch_remaining <= TOLERANCE or idx > 0:
+            carry.status = CarryForwardStatus.RESOLVED
+            carry.resolved_match_id = parent_id
+            carry.resolved_at = _now()
+        elif abs(quantize(carry.amount - batch_remaining)) > TOLERANCE:
+            carry.amount = batch_remaining
+            carry.detail = {
+                **carry.detail, "group_ref": group_ref,
+                "remaining": str(batch_remaining),
+                "partially_consumed_by": group_ref,
+            }
     await db.flush()
     return created

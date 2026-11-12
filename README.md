@@ -96,7 +96,7 @@ cd backend && source .venv/bin/activate
 export RECON_DATABASE_URL="postgresql+asyncpg://recon:recon@<host>:5432/recon"
 bash scripts/verify.sh        # = pytest 全套 + seed 端到端
 # 或分步：
-python -m pytest tests/ -q    # 38 个用例
+python -m pytest tests/ -q    # 41 个用例
 python scripts/seed.py --reset
 ```
 
@@ -122,7 +122,7 @@ S9 第二主体 ADYEN/M2 批次 `SB-202610-M2`：保证金扣留行（RESERVE -1
 两笔流水合计 280 恰好等于批次净额，但逐笔匹配**不得**标记完成——“总额相等陷阱”的固定演示数据。
 
 ### 5.3 本环境实际执行过的验证（结论如实记录）
-- `python -m pytest tests/ -q`：**38 passed**（用户态 PostgreSQL 15，端口 5433）。
+- `python -m pytest tests/ -q`：**41 passed**（用户态 PostgreSQL 15，端口 5433；原 38 用例 + 本缺陷新增 3 个结转挂账回归用例）。
 - `python scripts/seed.py --reset`：端到端跑通，31 条原始消息中 2 条重复被丢弃、生成 28 个业务事件；
   v1 批次产生 5 条差异（AMOUNT/FX/TIMING 各 1、UNKNOWN 2）并全部人工处置关闭；
   S9 的 M2 批次对账产生 2 条 UNKNOWN（跨主体 + 入账不足）并保持 OPEN 供工作台演示；
@@ -134,6 +134,12 @@ S9 第二主体 ADYEN/M2 批次 `SB-202610-M2`：保证金扣留行（RESERVE -1
   跨主体手工匹配未勾选 ack 返回 400 拦截，勾选后落 `CROSS_ENTITY_MANUAL`；
   拒收 PROPOSED 建议后 RATIO 比例拆分 200 → 109.09/90.91（尾差并入末行），
   两行余额 7.91/6.59 自动结转挂账；重跑对账后引擎 SHORT_FALL 挂账自动 RESOLVED、人工 PARTIAL_SPLIT 挂账保留。
+- 跨主体流水部分核销后结转余额重复缺陷的修复复测（真实 HTTP 调用，场景 S9 / 批次 `SB-202610-M2`）：
+  修复前对 `BK-M2-2`（80，跨主体）DETAIL 只核销 30，原 `CROSS_ENTITY` 挂账仍挂 80 且新增一笔 50 的
+  `PARTIAL_SPLIT` 挂账，同一余额被列两次（80+50）；修复后原挂账原地扣减为 **50.00**、不再新增，
+  `GET /api/matching/workspace/1` 刷新与 `POST /api/batches/1/reconcile` 重跑后该流水都只剩**一条 50.00 的 OPEN 挂账，
+  且金额等于流水实际残差**；继续核销剩余 50 后挂账 RESOLVED、未匹配列表不再出现该流水。
+  同主体流水多次部分核销时挂账只原地更新（150→100）不重复登记；新增 3 个回归用例覆盖上述路径。
 - 前端 `npm run build` 构建成功（91 modules）；Vite dev server + `/api` 代理联调返回真实数据。
 - 说明：本环境无 Docker 守护进程，**未实际执行镜像构建**，Dockerfile/compose 已按标准编写并通过 YAML 校验，
   请在具备 Docker 的环境按第二节验证。
@@ -177,7 +183,7 @@ S9 第二主体 ADYEN/M2 批次 `SB-202610-M2`：保证金扣留行（RESERVE -1
 │   │   │   └── corrections.py   # 更正账与报表版本
 │   │   ├── routers/             # events / reconciliation / matching API
 │   │   └── demo/                # 9 类模拟事件与场景装载器
-│   ├── tests/                   # 38 个 pytest 验收用例
+│   ├── tests/                   # 41 个 pytest 验收用例
 │   └── scripts/seed.py verify.sh
 ├── frontend/                    # Vue 3 + Vite + vue-router + axios（含两层匹配工作台页）
 ├── db/DATA_LAYER.md             # 数据层与触发器设计说明
